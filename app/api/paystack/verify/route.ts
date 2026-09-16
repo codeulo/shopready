@@ -1,6 +1,14 @@
 import { NextResponse } from "next/server";
-import { getResendClient, getResendConfig, escapeHtml, isValidEmail } from "@/lib/resend";
+import {
+  getResendClient,
+  getResendConfig,
+  escapeHtml,
+  isValidEmail,
+} from "@/lib/resend";
 import { findPackage } from "@/lib/packages";
+
+import { rateLimit, getClientIp } from "@/lib/rate-limit";
+import { claimReference, isReferenceProcessed } from "@/lib/order-store";
 
 export const runtime = "nodejs";
 
@@ -26,21 +34,53 @@ type PaystackVerifyResponse = {
 };
 
 export async function POST(request: Request) {
-  let body: VerifyPayload;
+  const ip = getClientIp(request);
+  const { allowed } = rateLimit(`paystack-verify:${ip}`, {
+    limit: 10,
+    windowMs: 60_000,
+  });
+  if (!allowed) {
+    return NextResponse.json(
+      { error: "Too many requests. Please try again shortly." },
+      { status: 429 },
+    );
+  }
 
+  let body: VerifyPayload;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
+    return NextResponse.json(
+      { error: "Invalid request body." },
+      { status: 400 },
+    );
   }
 
   const { reference, name, email, whatsapp, packageId } = body;
 
   if (!reference?.trim()) {
-    return NextResponse.json({ error: "Missing transaction reference." }, { status: 400 });
+    return NextResponse.json(
+      { error: "Missing transaction reference." },
+      { status: 400 },
+    );
   }
   if (!name?.trim() || !email?.trim() || !isValidEmail(email.trim())) {
-    return NextResponse.json({ error: "Missing or invalid customer details." }, { status: 400 });
+    return NextResponse.json(
+      { error: "Missing or invalid customer details." },
+      { status: 400 },
+    );
+  }
+
+  const trimmedReference = reference.trim();
+
+  // If the webhook already fulfilled this reference, don't do it again —
+  // just tell the client it succeeded.
+  if (await isReferenceProcessed(trimmedReference)) {
+    return NextResponse.json({
+      ok: true,
+      reference: trimmedReference,
+      alreadyProcessed: true,
+    });
   }
 
   const secretKey = process.env.PAYSTACK_SECRET_KEY;
@@ -48,7 +88,7 @@ export async function POST(request: Request) {
     console.error("Paystack is not configured: missing PAYSTACK_SECRET_KEY.");
     return NextResponse.json(
       { error: "Payments aren't configured yet. Please try again later." },
-      { status: 500 }
+      { status: 500 },
     );
   }
 
@@ -56,31 +96,90 @@ export async function POST(request: Request) {
   let verifyData: PaystackVerifyResponse;
   try {
     const verifyRes = await fetch(
-      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference.trim())}`,
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(trimmedReference)}`,
       {
         headers: { Authorization: `Bearer ${secretKey}` },
         cache: "no-store",
-      }
+      },
     );
     verifyData = await verifyRes.json();
   } catch (error) {
     console.error("Failed to reach Paystack verify endpoint:", error);
     return NextResponse.json(
-      { error: "Couldn't confirm payment with Paystack. Please contact support." },
-      { status: 502 }
+      {
+        error:
+          "Couldn't confirm payment with Paystack. Please contact support.",
+      },
+      { status: 502 },
     );
   }
 
   if (!verifyData.status || verifyData.data?.status !== "success") {
     return NextResponse.json(
       { error: verifyData.message || "Payment was not successful." },
-      { status: 402 }
+      { status: 402 },
     );
   }
 
+  const paystackAmount = verifyData.data.amount;
+  const paystackCurrency = verifyData.data.currency;
+  const paystackEmail = verifyData.data.customer?.email?.trim().toLowerCase();
+
+  // --- Amount validation: never trust a client-supplied price. ---
   const pkg = packageId ? findPackage(packageId) : undefined;
-  const amountNaira = verifyData.data.amount / 100;
-  const packageLabel = pkg ? `${pkg.name} — ${pkg.price}` : `₦${amountNaira.toLocaleString()}`;
+  if (packageId && !pkg) {
+    console.error(
+      `Verify: unknown packageId "${packageId}" for reference ${trimmedReference}.`,
+    );
+    return NextResponse.json({ error: "Unknown package." }, { status: 400 });
+  }
+  if (pkg) {
+    const expectedKobo = Math.round(pkg.amountNaira * 100);
+    if (paystackAmount !== expectedKobo || paystackCurrency !== "NGN") {
+      console.error(
+        `Verify: amount mismatch for ${trimmedReference}. Expected ${expectedKobo} NGN kobo, got ${paystackAmount} ${paystackCurrency}.`,
+      );
+      return NextResponse.json(
+        {
+          error:
+            "The amount paid doesn't match the selected package. Please contact support with your reference.",
+        },
+        { status: 402 },
+      );
+    }
+  }
+
+  // --- Email cross-check: use Paystack's customer email as the source of
+  // truth, not whatever the client claims, so a valid reference can't be
+  // replayed with an arbitrary email to trigger emails "from" your domain. ---
+  if (paystackEmail && paystackEmail !== email.trim().toLowerCase()) {
+    console.warn(
+      `Verify: email mismatch for ${trimmedReference}. Paystack: ${paystackEmail}, submitted: ${email.trim()}.`,
+    );
+    return NextResponse.json(
+      {
+        error:
+          "The email doesn't match this payment. Please contact support with your reference.",
+      },
+      { status: 400 },
+    );
+  }
+
+  // Atomically claim the reference so a retried client request (or a race
+  // with the webhook) can't send the confirmation emails twice.
+  const claimed = await claimReference(trimmedReference);
+  if (!claimed) {
+    return NextResponse.json({
+      ok: true,
+      reference: trimmedReference,
+      alreadyProcessed: true,
+    });
+  }
+
+  const amountNaira = paystackAmount / 100;
+  const packageLabel = pkg
+    ? `${pkg.name} — ${pkg.price}`
+    : `₦${amountNaira.toLocaleString()}`;
 
   // Best-effort notification emails — payment already succeeded, so failures here don't fail the request.
   const { apiKey, toEmail, fromEmail } = getResendConfig();
@@ -105,7 +204,7 @@ export async function POST(request: Request) {
                 <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Email</td><td>${safe(email.trim())}</td></tr>
                 <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Package</td><td>${safe(packageLabel)}</td></tr>
                 <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Amount paid</td><td>₦${amountNaira.toLocaleString()}</td></tr>
-                <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Reference</td><td>${safe(reference.trim())}</td></tr>
+                <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Reference</td><td>${safe(trimmedReference)}</td></tr>
               </tbody>
             </table>
           </div>
@@ -124,7 +223,7 @@ export async function POST(request: Request) {
           <div style="font-family: sans-serif; font-size: 15px; color: #1b4332; line-height: 1.6;">
             <p>Hi ${safe(name.trim().split(" ")[0] || name.trim())},</p>
             <p>We've received your payment of <strong>₦${amountNaira.toLocaleString()}</strong> for <strong>${safe(packageLabel)}</strong>. Thank you!</p>
-            <p>Reference: <code>${safe(reference.trim())}</code></p>
+            <p>Reference: <code>${safe(trimmedReference)}</code></p>
             <p>We'll be in touch on WhatsApp or email within one business day to get things moving.</p>
             <p style="margin-top: 24px;">Talk soon,<br/>The StoreReady team</p>
           </div>
@@ -137,5 +236,9 @@ export async function POST(request: Request) {
     console.warn("Resend not configured — skipping order confirmation emails.");
   }
 
-  return NextResponse.json({ ok: true, amountNaira, reference: reference.trim() });
+  return NextResponse.json({
+    ok: true,
+    amountNaira,
+    reference: trimmedReference,
+  });
 }

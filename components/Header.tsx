@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Menu, X, Store } from "lucide-react";
+import { Menu, X } from "lucide-react";
 import { usePurchaseModal } from "./purchase-modal-context";
 import Image from "next/image";
 
